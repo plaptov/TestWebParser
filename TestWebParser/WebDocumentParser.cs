@@ -35,14 +35,6 @@ namespace TestWebParser
 		/// Внутренний счётчик скачиваний в очереди
 		/// </summary>
 		private int _downloadCount;
-		/// <summary>
-		/// Очередь на парсинг
-		/// </summary>
-		private ConcurrentQueue<DownloadStringResult> _parseQueue;
-		/// <summary>
-		/// Внутренний счётчик парсингов в очереди
-		/// </summary>
-		private int _parseCount;
 
 		/// <summary>
 		/// Создать экземпляр класса
@@ -56,7 +48,6 @@ namespace TestWebParser
 			// Парсер нужен обязательно
 			_parser = parser ?? throw new ArgumentNullException(nameof(parser));
 			_downloadQueue = new ConcurrentQueue<DownloadStringRequest>();
-			_parseQueue = new ConcurrentQueue<DownloadStringResult>();
 		}
 
 		/// <summary>
@@ -73,7 +64,7 @@ namespace TestWebParser
 			var cnt = Interlocked.Increment(ref _downloadCount);
 			// Если добавили первый элемент в очередь, пускаем поток на обработку
 			if (cnt == 1)
-				new Thread(ProcessDownloadQueue).Start();
+				ProcessDownloadQueue();
 			// Возвращаем обещание
 			return tcs.Task;
 		}
@@ -83,65 +74,34 @@ namespace TestWebParser
 		/// </summary>
 		private async void ProcessDownloadQueue()
 		{
-			// Чтоб не создавать новые потоки на каждую незначительную задержку,
-			// допускаем некоторое ожидание вхолостую, тут - секунда
-			const int maxTryCount = 100;
-			const int waitPeriod = 10;
-			int tryCount = 0;
 			// Увеличиваем счётчик на фиктивную единицу, чтобы холостой цикл снаружи тоже считался как "занято"
 			Interlocked.Increment(ref _downloadCount);
-			while (tryCount < maxTryCount)
+			string html = null;
+			DownloadStringRequest curReq = null;
+			DownloadStringRequest nextReq = null;
+			while (true)
 			{
-				DownloadStringRequest req;
+				curReq = nextReq;
+				if (curReq != null)
+					html = await curReq.Task;
 				// Проверяем, есть ли что-нибудь в очереди
-				if (!_downloadQueue.TryDequeue(out req))
+				if (_downloadQueue.TryDequeue(out nextReq))
 				{
-					// Если пусто, подождём немножко
-					tryCount++;
-					// Может, SpinWait подошёл бы лучше, чтобы не переключать контекст, но я с ним не работал
-					Thread.Sleep(waitPeriod);
-					continue;
+					// Если есть, сразу запускаем таск на скачивание
+					nextReq.Task = _webClient.GetStringAsync(nextReq.Url);
 				}
-				// В следующий раз ждать начнём сначала
-				tryCount = 0;
+				else if (curReq == null)
+					break;
 				// Скачиваем строку и добавляем в очередь на парсинг
-				_parseQueue.Enqueue(new DownloadStringResult(req.Source, await _webClient.GetStringAsync(req.Url)));
-				// Уменьшаем счётчик в очереди на скачивание
-				Interlocked.Decrement(ref _downloadCount);
-				var cnt = Interlocked.Increment(ref _parseCount);
-				// Если добавили первый элемент в очередь, запускаем поток на обработку
-				if (cnt == 1)
-					new Thread(ProcessParseQueue).Start();
+				if (curReq != null)
+				{
+					curReq.Source.SetResult(_parser.Parse(html));
+					// Уменьшаем счётчик в очереди на скачивание
+					Interlocked.Decrement(ref _downloadCount);
+				}
 			}
 			// Уменьшаем на фиктивную единицу, чтобы следующее добавление запустило новый поток
 			Interlocked.Decrement(ref _downloadCount);
-		}
-
-		/// <summary>
-		/// Метод обработки очереди на парсинг.
-		/// Почти идентичен предыдущему
-		/// </summary>
-		private void ProcessParseQueue()
-		{
-			const int maxTryCount = 100;
-			const int waitPeriod = 10;
-			int tryCount = 0;
-			Interlocked.Increment(ref _parseCount);
-			while (tryCount < maxTryCount)
-			{
-				DownloadStringResult req;
-				if (!_parseQueue.TryDequeue(out req))
-				{
-					tryCount++;
-					Thread.Sleep(waitPeriod);
-					continue;
-				}
-				tryCount = 0;
-				// Парсим документ и подтверждаем таск
-				req.Source.SetResult(_parser.Parse(req.Text));
-				Interlocked.Decrement(ref _parseCount);
-			}
-			Interlocked.Decrement(ref _parseCount);
 		}
 
 		private class DownloadStringRequest
@@ -154,18 +114,8 @@ namespace TestWebParser
 
 			public TaskCompletionSource<IHtmlDocument> Source { get; private set; }
 			public string Url { get; private set; }
-		}
 
-		private class DownloadStringResult
-		{
-			public DownloadStringResult(TaskCompletionSource<IHtmlDocument> source, string text)
-			{
-				Source = source;
-				Text = text;
-			}
-
-			public TaskCompletionSource<IHtmlDocument> Source { get; private set; }
-			public string Text { get; private set; }
+			public Task<string> Task { get; set; }
 		}
 	}
 }
